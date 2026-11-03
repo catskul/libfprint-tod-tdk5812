@@ -1,0 +1,18 @@
+/build/
+__pycache__/
+*.pyc
+
+# never commit: vendor firmware/binaries, sensor pairing secrets, fingerprint images
+*.bin
+*.dll
+*.cab
+*.inf
+*.cat
+*.pgm
+*.png
+*.plain
+*.enc
+*.npy
+/data/
+/captures/
+tools/match-matrix

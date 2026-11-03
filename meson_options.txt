@@ -1,0 +1,2 @@
+option('firmware_path', type: 'string', value: '/usr/local/share/tdk5812/tdk_dmp.bin',
+       description: 'Where the driver loads the sensor DMP firmware from (see firmware/fetch-firmware.py)')
