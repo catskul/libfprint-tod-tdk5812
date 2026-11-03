@@ -22,7 +22,7 @@ Check yours with `lsusb -v -d 0bda:5812 | grep bcdDevice`. On unsupported revisi
 ## Install (Ubuntu 24.04)
 
 ```bash
-git clone <this repo> && cd libfprint-tod-tdk5812
+git clone https://github.com/catskul/libfprint-tod-tdk5812.git && cd libfprint-tod-tdk5812
 ./install.sh
 ```
 
