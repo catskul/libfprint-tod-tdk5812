@@ -72,6 +72,19 @@ That is a small, single-person dataset. Contributions of more data are very welc
 - `tools/`: Python userspace driver for research, data collection and matcher evaluation (see `tools/README.md`)
 - `docs/PROTOCOL.md`: the reverse-engineered USB/sensor/crypto protocol
 
+## Related work
+
+[`christianfarmerf/libfprint-rts5812`](https://github.com/christianfarmerf/libfprint-rts5812) is an independent
+driver for the **same device** (`0bda:5812` + TDK sensor), developed in parallel. It reaches the same protocol,
+firmware and crypto findings, and also uses its own keypoint matcher. The implementations differ in approach:
+
+- It uses an idiomatic `FpiSsm` async state machine for the capture loop; this driver runs all I/O in a worker
+  thread with a watchdog (stuck-transfer cancel + USB reset), which also protects the bring-up/open path.
+- It fixes `open` racing system suspend via a small **libfprint core patch**; this driver instead implements
+  in-driver suspend/resume and needs no changes to libfprint.
+
+Worth a look if you want a second reference, or the deferred-open behaviour (ideally that belongs upstream).
+
 ## Legal
 
 This driver was written for interoperability, by analysing the publicly distributed Windows driver
