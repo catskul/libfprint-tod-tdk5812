@@ -47,7 +47,8 @@
 #define MIN_KEYPOINTS 40
 #define TEMPLATE_VERSION 1
 #define FEAT_CACHE_MAX 32     /* cached prints (fingers); cache is cleared when exceeded */
-#define POLL_MS       128
+#define POLL_MS       64
+#define REARM_POLLS   32     /* re-arm the sensor about every 2 s while waiting */
 #define FINGER_OFF_MS 700
 #define COVER_GOOD    0.75   /* accept immediately */
 #define COVER_MIN     0.55   /* below this after settling: ask to re-place finger (matches collect.py) */
@@ -923,7 +924,7 @@ capture_frame (FpiDeviceTdk5812 *self, Op *op, GError **error)
 
       if (!wait_ms (self, POLL_MS, error))
         return FALSE;
-      if (++polls % 16 == 0 && !arm (dev, error))
+      if (++polls % REARM_POLLS == 0 && !arm (dev, error))
         return FALSE;
       if (!bridge_cmd (dev, OP_IMG_STATUS, 0, TRUE, &st, 1, error))
         return FALSE;
