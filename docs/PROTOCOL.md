@@ -5,7 +5,7 @@ binary's own debug strings. Addresses are VAs in the DLL.
 
 ## USB
 
-One vendor interface: bulk `0x01` OUT, bulk `0x82` IN (64 B packets), and interrupt `0x83`/`0x84` (unused).
+One vendor interface: bulk `0x01` OUT, bulk `0x82` IN (64 B packets), and interrupt `0x83`/`0x84` (silent; see below).
 
 Every bridge command:
 
@@ -26,6 +26,20 @@ IN   <status> xx xx xx xx                           5 bytes, status 0 = OK
 | `E8` | retrieveSecSessionKey | IN 0x3B4 bytes: read pairing record (`"TCFS"` magic) |
 
 `UpdateMcuFwEx`/`FW.BIN` (bridge MCU flash update) exists in the Windows driver. Never touch it.
+
+### No touch events: polling is the only way (tested 2026-11-07)
+
+Touches are reported **only** through the polled `getImageStatus` flag. Windows polls it every 128 ms; this driver
+polls every 64 ms.
+
+- **Interrupt endpoints `0x83`/`0x84`:** Windows opens both pipes but never reads them. With the sensor armed, they
+  delivered no data during 22 real touches (`tools/irq_probe.py`).
+- **Opcodes `0x64`/`0x65`:** command templates exist in the DLL, but no code references them. They have not been
+  sent (their meaning is unknown).
+- **USB remote wakeup:** the configuration attribute `0xa0` advertises it, but no touch-triggered wakeup was seen.
+  With runtime autosuspend allowed, the device resumed on a fixed ~1.2 s rhythm. That resume came from the host side
+  (same rhythm with wakeup disabled), and the bridge captured **no** frames while suspending
+  (`tools/wake_probe.py`). So keep the device awake while waiting for a finger.
 
 ## Sensor registers (InvenSense-style, SPI behind the bridge)
 

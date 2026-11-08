@@ -20,6 +20,7 @@ sudo venv/bin/python -u tools/collect.py         # guided collection -> data/<fi
 | `capture.py`, `topng.py` | raw capture and PNG rendering |
 | `collect.py` | guided dataset collection (20 genuine + 4×5 other fingers) |
 | `feat_eval.py` | Python prototype of the matcher plus FAR/FRR simulation (needs `python3-opencv`) |
+| `irq_probe.py`, `wake_probe.py` | experiments showing the bridge has no usable interrupt or remote-wakeup touch events (see `docs/PROTOCOL.md`) |
 | `match-matrix.c` | score matrix using the driver's exact C++ matcher (build line at the top of the file) |
 
 **Privacy:** `data/` and `captures/` hold fingerprint images. They are git-ignored; don't publish them.
