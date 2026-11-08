@@ -34,12 +34,26 @@ polls every 64 ms.
 
 - **Interrupt endpoints `0x83`/`0x84`:** Windows opens both pipes but never reads them. With the sensor armed, they
   delivered no data during 22 real touches (`tools/irq_probe.py`).
-- **Opcodes `0x64`/`0x65`:** command templates exist in the DLL, but no code references them. They have not been
-  sent (their meaning is unknown).
+- **Opcodes `0x64`/`0x65`:** command templates exist in the DLL, but no code references them, and they have not
+  been sent (meaning unknown). The bridge firmware was dumped (below) to try to decode them; its packet dispatcher
+  wasn't cleanly recovered, so they remain unidentified. **Do not send them** — see the flash note below.
 - **USB remote wakeup:** the configuration attribute `0xa0` advertises it, but no touch-triggered wakeup was seen.
   With runtime autosuspend allowed, the device resumed on a fixed ~1.2 s rhythm. That resume came from the host side
   (same rhythm with wakeup disabled), and the bridge captured **no** frames while suspending
   (`tools/wake_probe.py`). So keep the device awake while waiting for a finger.
+
+### Bridge firmware / flash
+
+The Windows `CBioDev::EnterDownloadMode` path reads the bridge over a vendor control request
+(`bmRequestType 0xC0`, `bRequest 0x2E`): `wIndex 0x1000` + `wLength 0x20` returns a 32-byte info block
+(VID/PID/REV + firmware versions, here `1.0.3` / `2.3.0`), and `wIndex = offset` reads the code region.
+`tools/bridge_info.py` does only this read.
+
+A dump (0xE000 bytes) shows an **8051** firmware with an RSA/ECDSA/ECDH stack and the Realtek/Realsil
+certificate chain that backs the secure session. The matching **write** path (`CUsbDev::UpdateFlashEx`,
+0xE000-byte flash write + read-back compare, and `UpdateMcuFwEx`) can rewrite that flash. **Never send the
+write requests or opcodes `0x64`/`0x65`:** a bad write can brick the reader (and Windows Hello) with no recovery
+path available to us. The dumped firmware is Realtek's and is not redistributed here.
 
 ## Sensor registers (InvenSense-style, SPI behind the bridge)
 
