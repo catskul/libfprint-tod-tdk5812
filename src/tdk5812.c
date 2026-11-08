@@ -66,13 +66,20 @@ struct _FpiDeviceTdk5812
   guint8        enc_key[32];
   guint8        sid[8];
   guint32       counter;
-  guint         poll_id;
-  guint         poll_count;
-  guint8        best[IMG_PX];  /* best frame seen while the finger settles */
-  gboolean      have_best;
-  gdouble       best_cover;
-  gint64        settle_until;  /* monotonic us; 0 = not settling */
   GPtrArray    *enroll_imgs;   /* guint8[IMG_PX] each */
+
+  /* worker thread state (see "worker") */
+  GCancellable *io_cancel;     /* cancels the running worker's USB I/O */
+  gpointer      xfer_start_ms; /* atomic: monotonic ms the current transfer started; NULL = idle */
+  guint         watchdog_id;
+  gboolean      busy;          /* a worker op is running */
+  gboolean      abandoned;     /* the running worker was given up on; ignore its result */
+  gboolean      wedged;        /* sensor stopped answering and its worker never returned */
+  gboolean      stuck;         /* the watchdog cancelled a stuck transfer */
+  gboolean      cancelling;
+  gboolean      suspending;
+  gboolean      needs_init;    /* re-run sensor bring-up before the next capture */
+  gboolean      claimed;
 };
 
 G_DECLARE_FINAL_TYPE (FpiDeviceTdk5812, fpi_device_tdk5812, FPI, DEVICE_TDK5812, FpDevice);
@@ -155,62 +162,95 @@ descramble (const guint8 rnd[8], const guint8 scrambled[32], guint8 dev_key[32])
 
 /* ------------------------------------------------------------------ bridge */
 
-/* fpi_usb_transfer_submit_sync() dereferences *error, so never hand it NULL */
-static gboolean
-xfer_sync (FpiUsbTransfer *t, guint timeout, GError **error)
-{
-  GError *local = NULL;
-  gboolean ok = fpi_usb_transfer_submit_sync (t, timeout, &local);
+/*
+ * All USB I/O runs in a worker thread (see "worker" below) that has its own thread-default
+ * GMainContext. gusb's synchronous transfer API spins the *global* default main context while
+ * it waits, which re-enters fprintd's D-Bus handling in the middle of a transfer and can wedge
+ * fprintd forever (observed 2026-11). The async API delivers its completion to the calling
+ * thread's context instead, so we wait on our private context and never touch fprintd's loop.
+ */
 
-  if (local)
-    g_propagate_error (error, local);
-  return ok;
+typedef struct
+{
+  GMainLoop *loop;
+  gssize     n;
+  GError    *error;
+} XferWait;
+
+static void
+xfer_cb (GObject *src, GAsyncResult *res, gpointer data)
+{
+  XferWait *w = data;
+
+  w->n = g_usb_device_bulk_transfer_finish (G_USB_DEVICE (src), res, &w->error);
+  g_main_loop_quit (w->loop);
+}
+
+static gboolean
+xfer (FpDevice *dev, guint8 ep, guint8 *buf, gsize len, gsize *actual, guint timeout, GError **error)
+{
+  FpiDeviceTdk5812 *self = FPI_DEVICE_TDK5812 (dev);
+  GMainContext *ctx = g_main_context_get_thread_default ();
+  XferWait w = { 0 };
+
+  if (ctx == NULL)
+    {
+      /* only the worker thread (which pushes its own context) may do USB I/O */
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_GENERAL, "USB I/O outside the worker thread");
+      return FALSE;
+    }
+  w.loop = g_main_loop_new (ctx, FALSE);
+  g_atomic_pointer_set (&self->xfer_start_ms,
+                        GSIZE_TO_POINTER ((gsize) (g_get_monotonic_time () / 1000) | 1));
+  g_usb_device_bulk_transfer_async (fpi_device_get_usb_device (dev), ep, buf, len, timeout,
+                                    self->io_cancel, xfer_cb, &w);
+  g_main_loop_run (w.loop);
+  g_atomic_pointer_set (&self->xfer_start_ms, NULL);
+  g_main_loop_unref (w.loop);
+  if (w.error)
+    {
+      g_propagate_error (error, w.error);
+      return FALSE;
+    }
+  if (actual)
+    *actual = w.n;
+  return TRUE;
 }
 
 static gboolean
 bridge_cmd (FpDevice *dev, guint8 op, guint8 reg, gboolean in,
             guint8 *buf, gsize len, GError **error)
 {
-  g_autoptr(FpiUsbTransfer) t = NULL;
   guint8 hdr[8] = { 0xF0, op, 0, 0, reg, 0, len & 0xff, (len >> 8) & 0xff };
+  guint8 st[64];
+  gsize act = 0;
 
-  t = fpi_usb_transfer_new (dev);
-  fpi_usb_transfer_fill_bulk (t, EP_OUT, 8);
-  memcpy (t->buffer, hdr, 8);
-  if (!xfer_sync (t, USB_TIMEOUT, error))
+  if (!xfer (dev, EP_OUT, hdr, sizeof hdr, NULL, USB_TIMEOUT, error))
     return FALSE;
-  g_clear_pointer (&t, fpi_usb_transfer_unref);
 
-  if (len)
+  if (len && in)
     {
-      t = fpi_usb_transfer_new (dev);
-      fpi_usb_transfer_fill_bulk (t, in ? EP_IN : EP_OUT, len);
-      if (!in)
-        memcpy (t->buffer, buf, len);
-      if (!xfer_sync (t, USB_TIMEOUT, error))
+      if (!xfer (dev, EP_IN, buf, len, &act, USB_TIMEOUT, error))
         return FALSE;
-      if (in)
+      if (act != len)
         {
-          if ((gsize) t->actual_length != len)
-            {
-              g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
-                           "short read %zd/%zu (op %02x)", t->actual_length, len, op);
-              return FALSE;
-            }
-          memcpy (buf, t->buffer, len);
+          g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
+                       "short read %zu/%zu (op %02x)", act, len, op);
+          return FALSE;
         }
-      g_clear_pointer (&t, fpi_usb_transfer_unref);
+    }
+  else if (len && !xfer (dev, EP_OUT, buf, len, NULL, USB_TIMEOUT, error))
+    {
+      return FALSE;
     }
 
-  t = fpi_usb_transfer_new (dev);
-  fpi_usb_transfer_fill_bulk (t, EP_IN, 64);
-  if (!xfer_sync (t, USB_TIMEOUT, error))
+  if (!xfer (dev, EP_IN, st, sizeof st, &act, USB_TIMEOUT, error))
     return FALSE;
-  if (t->actual_length != 5 || t->buffer[0] != 0)
+  if (act != 5 || st[0] != 0)
     {
       g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
-                   "bad status (op %02x reg %02x): len %zd b0 %02x",
-                   op, reg, t->actual_length, t->actual_length ? t->buffer[0] : 0);
+                   "bad status (op %02x reg %02x): len %zu b0 %02x",
+                   op, reg, act, act ? st[0] : 0);
       return FALSE;
     }
   return TRUE;
@@ -669,6 +709,85 @@ save_debug_image (const guint8 *px, gdouble cover, const char *tag)
   g_file_set_contents (path, (gchar *) b->data, b->len, NULL);
 }
 
+/* ------------------------------------------------------------------ worker
+ *
+ * Sensor bring-up and capture run in a GTask worker thread. The main loop only starts work and
+ * reacts to results, so a sensor that stops answering can never block fprintd. A watchdog on
+ * the main loop cancels any transfer stuck for too long; if even cancellation does not return,
+ * it gives up on the worker, reports an error, and refuses further use until it returns.
+ */
+
+#define XFER_STUCK_MS   6000   /* cancel a transfer that has been running longer than this */
+#define XFER_ABANDON_MS 10000  /* give up on the worker if it still has not returned */
+#define WATCHDOG_MS     500
+
+typedef enum { OP_OPEN, OP_CAPTURE } OpKind;
+
+typedef struct
+{
+  OpKind   kind;
+  gboolean init_first;   /* capture: re-run sensor bring-up first (after resume or an error) */
+  gboolean after_lift;   /* capture: let the finger lift and drop stale frames first */
+  gboolean got_image;
+  guint8   img[IMG_PX];
+  gdouble  cover;
+} Op;
+
+typedef struct
+{
+  FpiDeviceTdk5812   *self;
+  FpFingerStatusFlags add, remove;
+} FingerMsg;
+
+static gboolean
+finger_idle (gpointer data)
+{
+  FingerMsg *m = data;
+
+  if (!m->self->abandoned && fpi_device_get_current_action (FP_DEVICE (m->self)) != FPI_DEVICE_ACTION_NONE)
+    fpi_device_report_finger_status_changes (FP_DEVICE (m->self), m->add, m->remove);
+  g_object_unref (m->self);
+  g_free (m);
+  return G_SOURCE_REMOVE;
+}
+
+/* worker-side: finger status must be reported from the main thread */
+static void
+report_finger (FpiDeviceTdk5812 *self, FpFingerStatusFlags add, FpFingerStatusFlags remove)
+{
+  FingerMsg *m = g_new (FingerMsg, 1);
+
+  m->self = g_object_ref (self);
+  m->add = add;
+  m->remove = remove;
+  g_main_context_invoke (NULL, finger_idle, m);
+}
+
+/* worker-side: sleep, returning FALSE (with error) if the operation was cancelled */
+static gboolean
+wait_ms (FpiDeviceTdk5812 *self, guint ms, GError **error)
+{
+  gint64 end = g_get_monotonic_time () + (gint64) ms * 1000;
+
+  while (g_get_monotonic_time () < end)
+    {
+      if (g_cancellable_set_error_if_cancelled (self->io_cancel, error))
+        return FALSE;
+      g_usleep (10 * 1000);
+    }
+  return !g_cancellable_set_error_if_cancelled (self->io_cancel, error);
+}
+
+static void
+drain (FpDevice *dev)
+{
+  g_autofree guint8 *junk = g_malloc (FRAME_READ);
+
+  for (int i = 0; i < 64; i++)
+    if (!xfer (dev, EP_IN, junk, FRAME_READ, NULL, 50, NULL))
+      break;
+}
+
 static gboolean
 arm (FpDevice *dev, GError **error)
 {
@@ -677,137 +796,342 @@ arm (FpDevice *dev, GError **error)
   return bridge_cmd (dev, OP_SET_MODE, 0, FALSE, &one, 1, error);
 }
 
-static void
-stop_poll (FpiDeviceTdk5812 *self)
-{
-  g_clear_handle_id (&self->poll_id, g_source_remove);
-  self->have_best = FALSE;
-  self->best_cover = 0;
-  self->settle_until = 0;
-}
-
-static void capture_done (FpiDeviceTdk5812 *self, const guint8 *img, GError *error);
-
 static gboolean
-capture_finish_best (FpiDeviceTdk5812 *self)
+bring_up (FpiDeviceTdk5812 *self, gboolean reset, GError **error)
 {
-  self->poll_id = 0;
-  self->settle_until = 0;
-  if (self->best_cover < COVER_MIN)
-    {
-      fp_dbg ("best coverage %.2f too low", self->best_cover);
-      self->have_best = FALSE;
-      capture_done (self, NULL, fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
-      return G_SOURCE_REMOVE;
-    }
-  fp_dbg ("using frame with coverage %.2f", self->best_cover);
-  self->have_best = FALSE;
-  capture_done (self, self->best, NULL);
-  return G_SOURCE_REMOVE;
-}
-
-static gboolean
-poll_cb (gpointer user_data)
-{
-  FpiDeviceTdk5812 *self = user_data;
   FpDevice *dev = FP_DEVICE (self);
-  GError *error = NULL;
-  g_autofree guint8 *frame = NULL;
-  guint8 st = 0, img[IMG_PX];
-  gdouble cover;
+  GUsbDevice *usb = fpi_device_get_usb_device (dev);
 
-  if (++self->poll_count % 16 == 0 && !arm (dev, &error))
-    goto fail;
-  if (!bridge_cmd (dev, OP_IMG_STATUS, 0, TRUE, &st, 1, &error))
-    goto fail;
-  if (st != 1)
+  if (reset)
     {
-      if (self->settle_until && g_get_monotonic_time () > self->settle_until)
-        return capture_finish_best (self);
-      return G_SOURCE_CONTINUE;
+      fp_info ("resetting the USB device");
+      if (self->claimed)
+        {
+          g_usb_device_release_interface (usb, 0, 0, NULL);
+          self->claimed = FALSE;
+        }
+      if (!g_usb_device_reset (usb, error))
+        return FALSE;
+    }
+  if (!self->claimed)
+    {
+      if (!g_usb_device_claim_interface (usb, 0, 0, error))
+        return FALSE;
+      self->claimed = TRUE;
+    }
+  drain (dev);
+
+  /* test hook: TDK5812_TEST_STALL=1 makes the first (non-reset) bring-up issue a read that never
+   * completes, to exercise the watchdog -> cancel -> USB reset -> retry path */
+  if (!reset && g_getenv ("TDK5812_TEST_STALL"))
+    {
+      guint8 junk[64];
+      fp_warn ("TDK5812_TEST_STALL: issuing a read with no timeout");
+      if (!xfer (dev, EP_IN, junk, sizeof junk, NULL, 0, error))
+        return FALSE;
     }
 
-  frame = g_malloc (FRAME_READ);
-  if (!bridge_cmd (dev, OP_IMG_DATA, 0, TRUE, frame, FRAME_READ, &error) || !arm (dev, &error))
-    goto fail;
-  {
-    g_autoptr(GError) ferr = NULL;
-    if (!frame_decrypt (self, frame, img, &ferr))
-      {
-        fp_dbg ("ignoring frame: %s", ferr->message);
-        return G_SOURCE_CONTINUE;
-      }
-  }
-  if (!self->settle_until)
-    fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_PRESENT, FP_FINGER_STATUS_NEEDED);
-
-  cover = coverage (img);
-  fp_dbg ("frame after %u polls, coverage %.2f", self->poll_count, cover);
-  if (!self->have_best || cover > self->best_cover)
-    {
-      memcpy (self->best, img, IMG_PX);
-      self->best_cover = cover;
-      self->have_best = TRUE;
-    }
-  if (self->best_cover >= COVER_GOOD)
-    return capture_finish_best (self);
-  if (!self->settle_until)
-    self->settle_until = g_get_monotonic_time () + SETTLE_US;
-  else if (g_get_monotonic_time () > self->settle_until)
-    return capture_finish_best (self);
-  return G_SOURCE_CONTINUE;
-
-fail:
-  self->poll_id = 0;
-  capture_done (self, NULL, error);
-  return G_SOURCE_REMOVE;
+  return load_firmware (dev, error) && configure (dev, error) && pair_and_open (self, error);
 }
 
-static void
-capture_start (FpiDeviceTdk5812 *self)
-{
-  GError *error = NULL;
-
-  stop_poll (self);
-  if (!arm (FP_DEVICE (self), &error))
-    {
-      capture_done (self, NULL, error);
-      return;
-    }
-  fpi_device_report_finger_status_changes (FP_DEVICE (self), FP_FINGER_STATUS_NEEDED,
-                                           FP_FINGER_STATUS_PRESENT);
-  self->poll_count = 0;
-  self->poll_id = g_timeout_add (POLL_MS, poll_cb, self);
-}
-
-/* after a touch: give the user time to lift, then throw away frames taken meanwhile */
+/* one plain attempt; on failure (incl. a watchdog-cancelled stuck transfer) reset USB and retry once */
 static gboolean
-lift_done_cb (gpointer user_data)
+bring_up_with_retry (FpiDeviceTdk5812 *self, GError **error)
 {
-  FpiDeviceTdk5812 *self = user_data;
+  g_autoptr(GError) first = NULL;
+
+  if (bring_up (self, FALSE, &first))
+    return TRUE;
+  if (self->cancelling || self->suspending)
+    {
+      g_propagate_error (error, g_steal_pointer (&first));
+      return FALSE;
+    }
+  fp_warn ("sensor bring-up failed (%s); resetting USB and retrying once", first->message);
+  g_cancellable_reset (self->io_cancel);
+  return bring_up (self, TRUE, error);
+}
+
+static gboolean
+after_lift (FpiDeviceTdk5812 *self, GError **error)
+{
   FpDevice *dev = FP_DEVICE (self);
   guint8 st = 0;
 
-  self->poll_id = 0;
+  if (!wait_ms (self, FINGER_OFF_MS, error))
+    return FALSE;
   for (int i = 0; i < 8; i++)
     {
       g_autofree guint8 *junk = NULL;
-      if (!bridge_cmd (dev, OP_IMG_STATUS, 0, TRUE, &st, 1, NULL) || st != 1)
+
+      if (!bridge_cmd (dev, OP_IMG_STATUS, 0, TRUE, &st, 1, error))
+        return FALSE;
+      if (st != 1)
         break;
       junk = g_malloc (FRAME_READ);
-      bridge_cmd (dev, OP_IMG_DATA, 0, TRUE, junk, FRAME_READ, NULL);
-      self->counter = MAX (self->counter, (guint32) ((junk[12] << 24) | (junk[13] << 16) | (junk[14] << 8) | junk[15]));
+      if (!bridge_cmd (dev, OP_IMG_DATA, 0, TRUE, junk, FRAME_READ, error))
+        return FALSE;
+      self->counter = MAX (self->counter, (guint32) ((junk[12] << 24) | (junk[13] << 16) |
+                                                     (junk[14] << 8) | junk[15]));
     }
-  fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NONE, FP_FINGER_STATUS_PRESENT);
-  capture_start (self);
-  return G_SOURCE_REMOVE;
+  report_finger (self, FP_FINGER_STATUS_NONE, FP_FINGER_STATUS_PRESENT);
+  return TRUE;
+}
+
+/* wait for a touch; keep the best-covered frame while the finger settles */
+static gboolean
+capture_frame (FpiDeviceTdk5812 *self, Op *op, GError **error)
+{
+  FpDevice *dev = FP_DEVICE (self);
+  g_autofree guint8 *frame = g_malloc (FRAME_READ);
+  guint8 img[IMG_PX], st = 0;
+  gint64 settle_until = 0;
+  guint polls = 0;
+
+  if (!arm (dev, error))
+    return FALSE;
+  report_finger (self, FP_FINGER_STATUS_NEEDED, FP_FINGER_STATUS_PRESENT);
+  op->cover = -1;
+
+  for (;;)
+    {
+      gdouble cover;
+
+      if (!wait_ms (self, POLL_MS, error))
+        return FALSE;
+      if (++polls % 16 == 0 && !arm (dev, error))
+        return FALSE;
+      if (!bridge_cmd (dev, OP_IMG_STATUS, 0, TRUE, &st, 1, error))
+        return FALSE;
+      if (st != 1)
+        {
+          if (settle_until && g_get_monotonic_time () > settle_until)
+            break;
+          continue;
+        }
+      if (!bridge_cmd (dev, OP_IMG_DATA, 0, TRUE, frame, FRAME_READ, error) || !arm (dev, error))
+        return FALSE;
+      {
+        g_autoptr(GError) ferr = NULL;
+        if (!frame_decrypt (self, frame, img, &ferr))
+          {
+            fp_dbg ("ignoring frame: %s", ferr->message);
+            continue;
+          }
+      }
+      if (!settle_until)
+        report_finger (self, FP_FINGER_STATUS_PRESENT, FP_FINGER_STATUS_NEEDED);
+
+      cover = coverage (img);
+      fp_dbg ("frame after %u polls, coverage %.2f", polls, cover);
+      if (cover > op->cover)
+        {
+          memcpy (op->img, img, IMG_PX);
+          op->cover = cover;
+        }
+      if (op->cover >= COVER_GOOD)
+        break;
+      if (!settle_until)
+        settle_until = g_get_monotonic_time () + SETTLE_US;
+      else if (g_get_monotonic_time () > settle_until)
+        break;
+    }
+
+  if (op->cover < COVER_MIN)
+    {
+      fp_dbg ("best coverage %.2f too low", op->cover);
+      g_propagate_error (error, fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
+      return FALSE;
+    }
+  fp_dbg ("using frame with coverage %.2f", op->cover);
+  op->got_image = TRUE;
+  return TRUE;
 }
 
 static void
-wait_lift_then_capture (FpiDeviceTdk5812 *self)
+op_thread (GTask *task, gpointer source, gpointer data, GCancellable *unused)
 {
-  stop_poll (self);
-  self->poll_id = g_timeout_add (FINGER_OFF_MS, lift_done_cb, self);
+  FpiDeviceTdk5812 *self = source;
+  Op *op = data;
+  GMainContext *ctx = g_main_context_new ();
+  GError *error = NULL;
+  gboolean ok;
+
+  g_main_context_push_thread_default (ctx);
+  if (op->kind == OP_OPEN)
+    {
+      ok = bring_up_with_retry (self, &error);
+    }
+  else
+    {
+      ok = (!op->init_first || bring_up_with_retry (self, &error)) &&
+           (!op->after_lift || after_lift (self, &error)) &&
+           capture_frame (self, op, &error);
+    }
+  g_main_context_pop_thread_default (ctx);
+  g_main_context_unref (ctx);
+
+  if (ok)
+    g_task_return_boolean (task, TRUE);
+  else
+    g_task_return_error (task, error);
+}
+
+static void capture_done (FpiDeviceTdk5812 *self, const guint8 *img, GError *error);
+static void complete_cancelled (FpiDeviceTdk5812 *self);
+
+static void
+abandon_worker (FpiDeviceTdk5812 *self)
+{
+  FpDevice *dev = FP_DEVICE (self);
+  GError *err = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                          "fingerprint sensor stopped responding");
+
+  fp_warn ("sensor I/O did not return even after cancellation; giving up on it");
+  self->abandoned = TRUE;
+  self->wedged = TRUE;
+  if (self->suspending)
+    {
+      self->suspending = FALSE;
+      fpi_device_suspend_complete (dev, NULL);
+    }
+  switch (fpi_device_get_current_action (dev))
+    {
+    case FPI_DEVICE_ACTION_OPEN:
+      fpi_device_open_complete (dev, err);
+      break;
+
+    case FPI_DEVICE_ACTION_ENROLL:
+    case FPI_DEVICE_ACTION_VERIFY:
+    case FPI_DEVICE_ACTION_IDENTIFY:
+      g_clear_pointer (&self->enroll_imgs, g_ptr_array_unref);
+      fpi_device_action_error (dev, err);
+      break;
+
+    default:
+      g_error_free (err);
+      break;
+    }
+}
+
+static gboolean
+watchdog_cb (gpointer data)
+{
+  FpiDeviceTdk5812 *self = data;
+  gsize start = GPOINTER_TO_SIZE (g_atomic_pointer_get (&self->xfer_start_ms));
+  gint64 ran;
+
+  if (!self->busy)
+    {
+      self->watchdog_id = 0;
+      return G_SOURCE_REMOVE;
+    }
+  if (!start || self->abandoned)
+    return G_SOURCE_CONTINUE;
+  ran = g_get_monotonic_time () / 1000 - (gint64) start;
+  if (ran > XFER_ABANDON_MS)
+    abandon_worker (self);
+  else if (ran > XFER_STUCK_MS && !g_cancellable_is_cancelled (self->io_cancel))
+    {
+      fp_warn ("USB transfer stuck for %" G_GINT64_FORMAT " ms; cancelling it", ran);
+      self->stuck = TRUE;
+      g_cancellable_cancel (self->io_cancel);
+    }
+  return G_SOURCE_CONTINUE;
+}
+
+static void
+op_done (GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  FpiDeviceTdk5812 *self = FPI_DEVICE_TDK5812 (source);
+  FpDevice *dev = FP_DEVICE (self);
+  Op *op = g_task_get_task_data (G_TASK (res));
+  GError *error = NULL;
+  gboolean abandoned = self->abandoned;
+
+  g_task_propagate_boolean (G_TASK (res), &error);
+  self->busy = FALSE;
+  self->abandoned = FALSE;
+  g_clear_handle_id (&self->watchdog_id, g_source_remove);
+
+  if (abandoned)
+    {
+      fp_info ("stuck sensor I/O finally returned");
+      self->wedged = FALSE;
+      self->needs_init = TRUE;
+      g_clear_error (&error);
+      return;
+    }
+
+  if (self->stuck && error && g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED) &&
+      !self->cancelling && !self->suspending)
+    {
+      g_clear_error (&error);
+      error = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO, "fingerprint sensor stopped responding");
+    }
+  self->stuck = FALSE;
+
+  if (op->kind == OP_OPEN)
+    {
+      fpi_device_open_complete (dev, error);
+      return;
+    }
+
+  if (self->suspending)
+    {
+      /* capture paused for suspend; dev_resume restarts it */
+      self->needs_init = TRUE;
+      g_clear_error (&error);
+      fpi_device_suspend_complete (dev, NULL);
+      return;
+    }
+  if (self->cancelling)
+    {
+      self->cancelling = FALSE;
+      g_clear_error (&error);
+      complete_cancelled (self);
+      return;
+    }
+  if (error && error->domain != FP_DEVICE_RETRY)
+    self->needs_init = TRUE;   /* start from a fresh bring-up next time */
+  capture_done (self, op->got_image ? op->img : NULL, error);
+}
+
+/* main-thread: run an op in the worker (takes ownership of op) */
+static void
+start_op (FpiDeviceTdk5812 *self, Op *op)
+{
+  g_autoptr(GTask) task = NULL;
+
+  g_clear_object (&self->io_cancel);
+  self->io_cancel = g_cancellable_new ();
+  self->busy = TRUE;
+  self->abandoned = FALSE;
+  self->stuck = FALSE;
+  task = g_task_new (self, NULL, op_done, NULL);
+  g_task_set_task_data (task, op, g_free);
+  g_task_run_in_thread (task, op_thread);
+  if (!self->watchdog_id)
+    self->watchdog_id = g_timeout_add (WATCHDOG_MS, watchdog_cb, self);
+}
+
+static void
+start_capture (FpiDeviceTdk5812 *self, gboolean lift_first)
+{
+  Op *op;
+
+  if (self->busy || self->wedged)
+    {
+      capture_done (self, NULL, fpi_device_error_new_msg (FP_DEVICE_ERROR_BUSY,
+                                                          "fingerprint sensor is not responding"));
+      return;
+    }
+  op = g_new0 (Op, 1);
+  op->kind = OP_CAPTURE;
+  op->after_lift = lift_first;
+  op->init_first = self->needs_init;
+  self->needs_init = FALSE;
+  start_op (self, op);
 }
 
 /* ------------------------------------------------------------------ templates & matching */
@@ -871,7 +1195,7 @@ enroll_capture_done (FpiDeviceTdk5812 *self, const guint8 *img, GError *error)
   if (error && error->domain == FP_DEVICE_RETRY)
     {
       fpi_device_enroll_progress (dev, self->enroll_imgs->len, NULL, error);
-      wait_lift_then_capture (self);
+      start_capture (self, TRUE);
       return;
     }
   if (error)
@@ -890,7 +1214,7 @@ enroll_capture_done (FpiDeviceTdk5812 *self, const guint8 *img, GError *error)
       fp_dbg ("only %d keypoints, retry", nkp);
       fpi_device_enroll_progress (dev, self->enroll_imgs->len, NULL,
                                   fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
-      wait_lift_then_capture (self);
+      start_capture (self, TRUE);
       return;
     }
 
@@ -899,7 +1223,7 @@ enroll_capture_done (FpiDeviceTdk5812 *self, const guint8 *img, GError *error)
   fpi_device_enroll_progress (dev, self->enroll_imgs->len, NULL, NULL);
   if ((gint) self->enroll_imgs->len < fp_device_get_nr_enroll_stages (dev))
     {
-      wait_lift_then_capture (self);
+      start_capture (self, TRUE);
       return;
     }
 
@@ -1008,22 +1332,21 @@ dev_enroll (FpDevice *dev)
 
   g_clear_pointer (&self->enroll_imgs, g_ptr_array_unref);
   self->enroll_imgs = g_ptr_array_new_with_free_func (g_free);
-  capture_start (self);
+  start_capture (self, FALSE);
 }
 
 static void
 dev_verify_identify (FpDevice *dev)
 {
-  capture_start (FPI_DEVICE_TDK5812 (dev));
+  start_capture (FPI_DEVICE_TDK5812 (dev), FALSE);
 }
 
 static void
-dev_cancel (FpDevice *dev)
+complete_cancelled (FpiDeviceTdk5812 *self)
 {
-  FpiDeviceTdk5812 *self = FPI_DEVICE_TDK5812 (dev);
+  FpDevice *dev = FP_DEVICE (self);
   GError *err = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED, "Cancelled");
 
-  stop_poll (self);
   fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NONE,
                                            FP_FINGER_STATUS_NEEDED | FP_FINGER_STATUS_PRESENT);
   switch (fpi_device_get_current_action (dev))
@@ -1047,30 +1370,72 @@ dev_cancel (FpDevice *dev)
     }
 }
 
+static void
+dev_cancel (FpDevice *dev)
+{
+  FpiDeviceTdk5812 *self = FPI_DEVICE_TDK5812 (dev);
+
+  if (self->busy && !self->abandoned)
+    {
+      /* op_done completes the action once the worker has stopped touching the device */
+      self->cancelling = TRUE;
+      g_cancellable_cancel (self->io_cancel);
+      return;
+    }
+  complete_cancelled (self);
+}
+
+static void
+dev_suspend (FpDevice *dev)
+{
+  FpiDeviceTdk5812 *self = FPI_DEVICE_TDK5812 (dev);
+
+  fp_dbg ("suspend");
+  if (self->busy && !self->abandoned)
+    {
+      /* op_done reports suspend completion once the capture has stopped */
+      self->suspending = TRUE;
+      g_cancellable_cancel (self->io_cancel);
+      return;
+    }
+  self->needs_init = TRUE;
+  fpi_device_suspend_complete (dev, NULL);
+}
+
+static void
+dev_resume (FpDevice *dev)
+{
+  FpiDeviceTdk5812 *self = FPI_DEVICE_TDK5812 (dev);
+
+  fp_dbg ("resume");
+  self->suspending = FALSE;
+  self->needs_init = TRUE;   /* the sensor may have lost power: firmware and session are gone */
+  fpi_device_resume_complete (dev, NULL);
+  if (!self->wedged)
+    start_capture (self, FALSE);   /* continue the pending enroll/verify/identify */
+}
+
 /* ------------------------------------------------------------------ lifecycle */
 
 static void
 dev_open (FpDevice *dev)
 {
   FpiDeviceTdk5812 *self = FPI_DEVICE_TDK5812 (dev);
-  GError *error = NULL;
+  Op *op;
 
-  if (!g_usb_device_claim_interface (fpi_device_get_usb_device (dev), 0, 0, &error))
+  if (self->busy)
     {
-      fpi_device_open_complete (dev, error);
+      fpi_device_open_complete (dev, fpi_device_error_new_msg (FP_DEVICE_ERROR_BUSY,
+                                "fingerprint sensor is not responding; restart fprintd or the computer"));
       return;
     }
-  /* drain anything a previous (interrupted) user left queued on the bridge */
-  for (int i = 0; i < 64; i++)
-    {
-      g_autoptr(FpiUsbTransfer) t = fpi_usb_transfer_new (dev);
-      fpi_usb_transfer_fill_bulk (t, EP_IN, FRAME_READ);
-      if (!xfer_sync (t, 50, NULL))
-        break;
-    }
-  if (load_firmware (dev, &error) && configure (dev, &error))
-    pair_and_open (self, &error);
-  fpi_device_open_complete (dev, error);
+  self->needs_init = FALSE;
+  self->wedged = FALSE;
+  self->cancelling = FALSE;
+  self->suspending = FALSE;
+  op = g_new0 (Op, 1);
+  op->kind = OP_OPEN;
+  start_op (self, op);
 }
 
 static void
@@ -1079,11 +1444,14 @@ dev_close (FpDevice *dev)
   FpiDeviceTdk5812 *self = FPI_DEVICE_TDK5812 (dev);
   GError *error = NULL;
 
-  stop_poll (self);
   g_clear_pointer (&self->enroll_imgs, g_ptr_array_unref);
   memset (self->mac_key, 0, 32);
   memset (self->enc_key, 0, 32);
-  g_usb_device_release_interface (fpi_device_get_usb_device (dev), 0, 0, &error);
+  if (!self->busy && self->claimed)
+    {
+      g_usb_device_release_interface (fpi_device_get_usb_device (dev), 0, 0, &error);
+      self->claimed = FALSE;
+    }
   fpi_device_close_complete (dev, error);
 }
 
@@ -1102,6 +1470,8 @@ fpi_device_tdk5812_finalize (GObject *obj)
 {
   FpiDeviceTdk5812 *self = FPI_DEVICE_TDK5812 (obj);
 
+  g_clear_handle_id (&self->watchdog_id, g_source_remove);
+  g_clear_object (&self->io_cancel);
   g_clear_pointer (&self->enroll_imgs, g_ptr_array_unref);
   G_OBJECT_CLASS (fpi_device_tdk5812_parent_class)->finalize (obj);
 }
@@ -1127,6 +1497,8 @@ fpi_device_tdk5812_class_init (FpiDeviceTdk5812Class *klass)
   dev_class->verify = dev_verify_identify;
   dev_class->identify = dev_verify_identify;
   dev_class->cancel = dev_cancel;
+  dev_class->suspend = dev_suspend;
+  dev_class->resume = dev_resume;
 
   fpi_device_class_auto_initialize_features (dev_class);
 }
