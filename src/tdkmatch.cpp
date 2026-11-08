@@ -31,7 +31,7 @@ tdk_feat_new (const unsigned char *img, int w, int h)
       cv::resize (src, up, cv::Size (), 2.0, 2.0, cv::INTER_CUBIC);
       cv::createCLAHE (2.0, cv::Size (4, 4))->apply (up, enh);
 
-      static cv::Ptr<cv::SIFT> sift = cv::SIFT::create (0, 3, 0.02, 10);
+      static thread_local cv::Ptr<cv::SIFT> sift = cv::SIFT::create (0, 3, 0.02, 10);
       tdk_feat *f = new tdk_feat;
       sift->detectAndCompute (enh, cv::noArray (), f->kp, f->des);
       return f;

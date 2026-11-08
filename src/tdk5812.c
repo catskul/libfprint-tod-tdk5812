@@ -46,6 +46,7 @@
 #define MATCH_THRESHOLD 12     /* RANSAC inliers; impostor max seen 4, genuine median ~47 */
 #define MIN_KEYPOINTS 40
 #define TEMPLATE_VERSION 1
+#define FEAT_CACHE_MAX 32     /* cached prints (fingers); cache is cleared when exceeded */
 #define POLL_MS       128
 #define FINGER_OFF_MS 700
 #define COVER_GOOD    0.75   /* accept immediately */
@@ -80,6 +81,11 @@ struct _FpiDeviceTdk5812
   gboolean      suspending;
   gboolean      needs_init;    /* re-run sensor bring-up before the next capture */
   gboolean      claimed;
+
+  /* enrolled-template features, computed once (in the worker while waiting for a finger) */
+  GHashTable   *feat_cache;    /* sha256(template) -> GPtrArray<tdk_feat*> (refcounted) */
+  GMutex        cache_lock;
+  GPtrArray    *match_tmpls;   /* GVariant template data of the current verify/identify */
 };
 
 G_DECLARE_FINAL_TYPE (FpiDeviceTdk5812, fpi_device_tdk5812, FPI, DEVICE_TDK5812, FpDevice);
@@ -731,7 +737,17 @@ typedef struct
   gboolean got_image;
   guint8   img[IMG_PX];
   gdouble  cover;
+  GPtrArray *tmpls;      /* capture: templates whose features to prefetch while waiting */
 } Op;
+
+static void
+op_free (Op *op)
+{
+  g_clear_pointer (&op->tmpls, g_ptr_array_unref);
+  g_free (op);
+}
+
+static GPtrArray *template_feats (FpiDeviceTdk5812 *self, GVariant *data);
 
 typedef struct
 {
@@ -892,6 +908,14 @@ capture_frame (FpiDeviceTdk5812 *self, Op *op, GError **error)
     return FALSE;
   report_finger (self, FP_FINGER_STATUS_NEEDED, FP_FINGER_STATUS_PRESENT);
   op->cover = -1;
+
+  /* compute enrolled features now, while waiting; a touch meanwhile stays buffered in the bridge */
+  for (guint i = 0; op->tmpls && i < op->tmpls->len; i++)
+    {
+      GPtrArray *feats = template_feats (self, g_ptr_array_index (op->tmpls, i));
+      if (feats)
+        g_ptr_array_unref (feats);
+    }
 
   for (;;)
     {
@@ -1109,7 +1133,7 @@ start_op (FpiDeviceTdk5812 *self, Op *op)
   self->abandoned = FALSE;
   self->stuck = FALSE;
   task = g_task_new (self, NULL, op_done, NULL);
-  g_task_set_task_data (task, op, g_free);
+  g_task_set_task_data (task, op, (GDestroyNotify) op_free);
   g_task_run_in_thread (task, op_thread);
   if (!self->watchdog_id)
     self->watchdog_id = g_timeout_add (WATCHDOG_MS, watchdog_cb, self);
@@ -1130,6 +1154,8 @@ start_capture (FpiDeviceTdk5812 *self, gboolean lift_first)
   op->kind = OP_CAPTURE;
   op->after_lift = lift_first;
   op->init_first = self->needs_init;
+  if (self->match_tmpls)
+    op->tmpls = g_ptr_array_ref (self->match_tmpls);
   self->needs_init = FALSE;
   start_op (self, op);
 }
@@ -1149,36 +1175,64 @@ templates_to_variant (GPtrArray *imgs)
   return g_variant_new ("(qqqaay)", TEMPLATE_VERSION, IMG_W, IMG_H, &b);
 }
 
-/* best inlier score of probe against every enrolled image of a print; -1 if unusable */
-static gint
-score_print (FpPrint *print, const tdk_feat *probe)
+/* features of every enrolled image of a template; cached by content hash. Returns a new
+ * reference, or NULL if the template is unusable. Safe to call from any thread. */
+static GPtrArray *
+template_feats (FpiDeviceTdk5812 *self, GVariant *data)
 {
-  g_autoptr(GVariant) data = NULL;
+  g_autofree gchar *key = NULL;
   g_autoptr(GVariant) arr = NULL;
+  GPtrArray *feats;
   guint16 ver, w, h;
-  gint best = -1;
 
-  g_object_get (print, "fpi-data", &data, NULL);
   if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE ("(qqqaay)")))
-    return -1;
+    return NULL;
+  key = g_compute_checksum_for_data (G_CHECKSUM_SHA256, g_variant_get_data (data),
+                                     g_variant_get_size (data));
+  g_mutex_lock (&self->cache_lock);
+  feats = g_hash_table_lookup (self->feat_cache, key);
+  if (feats)
+    g_ptr_array_ref (feats);
+  g_mutex_unlock (&self->cache_lock);
+  if (feats)
+    return feats;
+
   g_variant_get (data, "(qqq@aay)", &ver, &w, &h, &arr);
   if (ver != TEMPLATE_VERSION || w != IMG_W || h != IMG_H)
-    return -1;
+    return NULL;
+  feats = g_ptr_array_new_with_free_func ((GDestroyNotify) tdk_feat_free);
   for (gsize i = 0; i < g_variant_n_children (arr); i++)
     {
       g_autoptr(GVariant) e = g_variant_get_child_value (arr, i);
       gsize n = 0;
       const guint8 *px = g_variant_get_fixed_array (e, &n, 1);
-      tdk_feat *t;
-      gint s;
+      tdk_feat *f;
 
-      if (n != IMG_PX)
-        continue;
-      t = tdk_feat_new (px, IMG_W, IMG_H);
-      s = tdk_feat_score (probe, t);
-      tdk_feat_free (t);
-      best = MAX (best, s);
+      if (n == IMG_PX && (f = tdk_feat_new (px, IMG_W, IMG_H)))
+        g_ptr_array_add (feats, f);
     }
+  fp_dbg ("computed features for template %.12s (%u images)", key, feats->len);
+
+  g_mutex_lock (&self->cache_lock);
+  if (g_hash_table_size (self->feat_cache) >= FEAT_CACHE_MAX)
+    g_hash_table_remove_all (self->feat_cache);
+  g_hash_table_replace (self->feat_cache, g_steal_pointer (&key), g_ptr_array_ref (feats));
+  g_mutex_unlock (&self->cache_lock);
+  return feats;
+}
+
+/* best inlier score of probe against a print's enrolled images; -1 if unusable */
+static gint
+score_print (FpiDeviceTdk5812 *self, FpPrint *print, const tdk_feat *probe)
+{
+  g_autoptr(GVariant) data = NULL;
+  g_autoptr(GPtrArray) feats = NULL;
+  gint best = -1;
+
+  g_object_get (print, "fpi-data", &data, NULL);
+  feats = template_feats (self, data);
+  for (guint i = 0; feats && i < feats->len; i++)
+    best = MAX (best, tdk_feat_score (probe, g_ptr_array_index (feats, i)));
   return best;
 }
 
@@ -1274,7 +1328,7 @@ verify_capture_done (FpiDeviceTdk5812 *self, const guint8 *img, GError *error)
       gint s;
 
       fpi_device_get_verify_data (dev, &tmpl);
-      s = score_print (tmpl, probe);
+      s = score_print (self, tmpl, probe);
       fp_info ("verify score %d (threshold %d)", s, MATCH_THRESHOLD);
       fpi_device_verify_report (dev, s >= MATCH_THRESHOLD ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
                                 NULL, NULL);
@@ -1290,7 +1344,7 @@ verify_capture_done (FpiDeviceTdk5812 *self, const guint8 *img, GError *error)
       fpi_device_get_identify_data (dev, &prints);
       for (guint i = 0; i < prints->len; i++)
         {
-          gint s = score_print (g_ptr_array_index (prints, i), probe);
+          gint s = score_print (self, g_ptr_array_index (prints, i), probe);
           fp_dbg ("identify: print %u score %d", i, s);
           if (s >= MATCH_THRESHOLD && s > best)
             {
@@ -1331,14 +1385,42 @@ dev_enroll (FpDevice *dev)
   FpiDeviceTdk5812 *self = FPI_DEVICE_TDK5812 (dev);
 
   g_clear_pointer (&self->enroll_imgs, g_ptr_array_unref);
+  g_clear_pointer (&self->match_tmpls, g_ptr_array_unref);
   self->enroll_imgs = g_ptr_array_new_with_free_func (g_free);
   start_capture (self, FALSE);
 }
 
 static void
+add_template (GPtrArray *tmpls, FpPrint *print)
+{
+  GVariant *data = NULL;
+
+  g_object_get (print, "fpi-data", &data, NULL);
+  if (data)
+    g_ptr_array_add (tmpls, data);
+}
+
+static void
 dev_verify_identify (FpDevice *dev)
 {
-  start_capture (FPI_DEVICE_TDK5812 (dev), FALSE);
+  FpiDeviceTdk5812 *self = FPI_DEVICE_TDK5812 (dev);
+
+  g_clear_pointer (&self->match_tmpls, g_ptr_array_unref);
+  self->match_tmpls = g_ptr_array_new_with_free_func ((GDestroyNotify) g_variant_unref);
+  if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_VERIFY)
+    {
+      FpPrint *print = NULL;
+      fpi_device_get_verify_data (dev, &print);
+      add_template (self->match_tmpls, print);
+    }
+  else
+    {
+      GPtrArray *prints = NULL;
+      fpi_device_get_identify_data (dev, &prints);
+      for (guint i = 0; i < prints->len; i++)
+        add_template (self->match_tmpls, g_ptr_array_index (prints, i));
+    }
+  start_capture (self, FALSE);
 }
 
 static void
@@ -1463,6 +1545,9 @@ static const FpIdEntry id_table[] = {
 static void
 fpi_device_tdk5812_init (FpiDeviceTdk5812 *self)
 {
+  g_mutex_init (&self->cache_lock);
+  self->feat_cache = g_hash_table_new_full (g_str_hash, g_str_equal, g_free,
+                                            (GDestroyNotify) g_ptr_array_unref);
 }
 
 static void
@@ -1473,6 +1558,9 @@ fpi_device_tdk5812_finalize (GObject *obj)
   g_clear_handle_id (&self->watchdog_id, g_source_remove);
   g_clear_object (&self->io_cancel);
   g_clear_pointer (&self->enroll_imgs, g_ptr_array_unref);
+  g_clear_pointer (&self->match_tmpls, g_ptr_array_unref);
+  g_clear_pointer (&self->feat_cache, g_hash_table_unref);
+  g_mutex_clear (&self->cache_lock);
   G_OBJECT_CLASS (fpi_device_tdk5812_parent_class)->finalize (obj);
 }
 
